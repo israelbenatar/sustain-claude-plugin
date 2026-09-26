@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 
@@ -135,6 +136,19 @@ def plan(files: list[tuple[str, int]]) -> list[list[str]]:
     return batches
 
 
+#: Said once, in full, because the agent relays it to a person who then has to
+#: act on it. The skill runs anywhere python3 does — macOS, Linux, Windows — and
+#: `curl` is the one thing it needs that is not in the standard library. It is
+#: present by default on macOS and on Windows 10 1803+, and on most Linux
+#: distributions, but not in slim containers or older Windows.
+CURL_MISSING = (
+    "curl is not installed, and this script uploads with it. Either install curl "
+    "(macOS: already present; Debian/Ubuntu: apt install curl; Windows 10 1803+: "
+    "already present) or skip the script entirely and give the user "
+    "upload_page_url from request_photos, which needs nothing installed."
+)
+
+
 def post(endpoint: str, batch: list[str], timeout: int) -> tuple[int, dict | None, str]:
     """POST one batch. Returns (http_status, parsed_body_or_None, raw)."""
     cmd = ["curl", "-sS", "--max-time", str(timeout), "-w", "\n%{http_code}", "-X", "POST"]
@@ -142,7 +156,15 @@ def post(endpoint: str, batch: list[str], timeout: int) -> tuple[int, dict | Non
         cmd += ["-F", f"files=@{path}"]
     cmd.append(endpoint)
 
-    done = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        done = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        # No curl on this machine. Reached only if the preflight in main() was
+        # bypassed; without this the user gets a bare traceback instead of a
+        # sentence telling them what to do.
+        return 0, None, CURL_MISSING
+    except OSError as exc:
+        return 0, None, f"could not run curl: {exc}"
     if done.returncode != 0:
         return 0, None, (done.stderr or "").strip() or f"curl exit {done.returncode}"
 
@@ -176,6 +198,11 @@ def main() -> int:
         return 2
     if args.folder and not os.path.isdir(args.folder):
         print(f"error: not a directory: {args.folder}", file=sys.stderr)
+        return 2
+    # Fail before surveying hundreds of files, not after. --dry-run never
+    # uploads, so it does not need curl.
+    if not args.dry_run and shutil.which("curl") is None:
+        print(f"error: {CURL_MISSING}", file=sys.stderr)
         return 2
     if not args.dry_run and not args.endpoint:
         print("error: --endpoint is required unless --dry-run", file=sys.stderr)

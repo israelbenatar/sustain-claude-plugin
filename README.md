@@ -17,8 +17,25 @@ install:
 
 | Script | What it does |
 | --- | --- |
-| `scan_photos.py` | Reads EXIF dates and GPS from the files on disk and clusters them into candidate trips or events. **It never reads image content** — no pixels, no AI, no network. Falls back to macOS `mdls` when a file carries no EXIF. |
+| `scan_photos.py` | Reads EXIF dates and GPS from the files on disk and clusters them into candidate trips or events. **It never reads image content** — no pixels, no AI, no network. |
 | `upload_folder.py` | Uploads the chosen files to Sustain over HTTPS, in batches, using a short-lived upload ticket the agent mints through the connector. |
+
+## What it runs on
+
+Anywhere `python3` runs — macOS, Linux and Windows. The EXIF reader is standard
+library, so the scan behaves identically on all three.
+
+`upload_folder.py` shells out to **`curl`**, the one thing it needs that is not in
+the standard library. That is already present on macOS and on Windows 10 1803+, and
+on most Linux distributions, but not in slim containers or on older Windows. When it
+is missing the script says so and names the alternative instead of failing obscurely
+— and `--dry-run` works without it.
+
+Two extras are macOS-only and simply do not apply elsewhere: reading Apple Photos
+libraries (`--photos-library`), and a Spotlight (`mdls`) lookup that recovers dates
+for files whose EXIF the stdlib reader cannot parse. On Linux and Windows the scan
+uses EXIF alone, and a file with no readable date is reported as undated rather than
+guessed at.
 
 ## What it sends, and where
 
@@ -62,5 +79,5 @@ MIT.
 
 This repository is the published copy of the plugin. The source of truth is the
 Sustain application repository, which builds the same files into the self-hosted
-marketplace archive — so a change made only here would be overwritten by the next
+marketplace archive -- so a change made only here would be overwritten by the next
 build there. Report problems as issues; send changes to the Sustain repository.
