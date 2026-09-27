@@ -5,19 +5,30 @@ The endpoint is rate limited at 20 requests/hour, so the only thing that makes a
 folder of any size uploadable is batching: as many files per request as the
 server will take. The caps below come from the server, not from taste --
 `SKILL.md` lists each one with its source. Staying under them is why this script
-exists instead of a loop of `curl` calls.
+exists instead of a loop of one-file-per-request uploads.
 
-Shells out to curl rather than building multipart bodies here: curl streams each
-file from disk, so a 400-photo folder never lands in memory.
+Standard library only, and nothing to install. The multipart body is STREAMED
+from disk rather than assembled in memory -- a 400-photo batch is hundreds of
+megabytes and must never land in a string. `_MultipartBody` below is the
+file-like object that does it.
+
+An earlier version shelled out to `curl` for that streaming. Two things were
+wrong with it: `curl` is absent from slim Linux images and older Windows, where
+this died with a bare traceback; and a subprocess that runs a network fetch
+tool reads to a scanner as a download-and-execute pattern, which the Claude
+directory surfaces to users as an install-time risk. Neither is worth a
+dependency the standard library can replace.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import mimetypes
 import os
-import shutil
-import subprocess
 import sys
+import urllib.error
+import urllib.request
+import uuid
 
 #: Server-side truth (`curation.album_views.ALLOWED_EXTENSIONS`). `.heif` and
 #: `.gif` are deliberately absent -- the server rejects them.
@@ -136,44 +147,130 @@ def plan(files: list[tuple[str, int]]) -> list[list[str]]:
     return batches
 
 
-#: Said once, in full, because the agent relays it to a person who then has to
-#: act on it. The skill runs anywhere python3 does — macOS, Linux, Windows — and
-#: `curl` is the one thing it needs that is not in the standard library. It is
-#: present by default on macOS and on Windows 10 1803+, and on most Linux
-#: distributions, but not in slim containers or older Windows.
-CURL_MISSING = (
-    "curl is not installed, and this script uploads with it. Either install curl "
-    "(macOS: already present; Debian/Ubuntu: apt install curl; Windows 10 1803+: "
-    "already present) or skip the script entirely and give the user "
-    "upload_page_url from request_photos, which needs nothing installed."
-)
+def _part_header(path: str, boundary: str) -> bytes:
+    """The header bytes preceding one file's content."""
+    # A quote or newline in a filename would break out of the header, so they
+    # are stripped rather than escaped -- the server keys on content, not name.
+    name = os.path.basename(path).replace('"', "").replace("\r", "").replace("\n", "")
+    ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
+    return (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="files"; filename="{name}"\r\n'
+        f"Content-Type: {ctype}\r\n\r\n"
+    ).encode("utf-8")
+
+
+class _MultipartBody:
+    """A file-like multipart body that reads each photo from disk on demand.
+
+    urllib will stream a body it cannot measure with chunked encoding, so the
+    exact length is computed up front from the headers and each file's stat.
+    That keeps the request a plain Content-Length POST, which is what the
+    upload endpoint expects.
+
+    Sizes are recorded at construction. A file that changes length between then
+    and being read would make the body disagree with Content-Length -- the same
+    exposure the previous curl implementation had, and not worth locking the
+    user's photo library to avoid.
+    """
+
+    def __init__(self, paths: list[str], boundary: str):
+        self._segments: list[tuple[str, object]] = []
+        self.length = 0
+        for path in paths:
+            header = _part_header(path, boundary)
+            size = os.path.getsize(path)
+            self._segments.append(("bytes", header))
+            self._segments.append(("file", (path, size)))
+            self._segments.append(("bytes", b"\r\n"))
+            self.length += len(header) + size + 2
+        closing = f"--{boundary}--\r\n".encode("utf-8")
+        self._segments.append(("bytes", closing))
+        self.length += len(closing)
+
+        self._index = 0
+        self._buffer = b""
+        self._handle = None
+        self._remaining = 0
+
+    def _advance(self) -> bool:
+        """Open the next segment. False when there are none left."""
+        if self._index >= len(self._segments):
+            return False
+        kind, payload = self._segments[self._index]
+        self._index += 1
+        if kind == "bytes":
+            self._buffer = payload
+        else:
+            path, size = payload
+            self._handle = open(path, "rb")
+            self._remaining = size
+        return True
+
+    def read(self, size: int = -1) -> bytes:
+        out = []
+        want = size if size is not None and size >= 0 else None
+        while want is None or want > 0:
+            if self._buffer:
+                take = self._buffer if want is None else self._buffer[:want]
+                self._buffer = self._buffer[len(take):]
+                out.append(take)
+                if want is not None:
+                    want -= len(take)
+                continue
+            if self._handle is not None:
+                n = self._remaining if want is None else min(want, self._remaining)
+                chunk = self._handle.read(n) if n > 0 else b""
+                if chunk:
+                    self._remaining -= len(chunk)
+                    out.append(chunk)
+                    if want is not None:
+                        want -= len(chunk)
+                    continue
+                self._handle.close()
+                self._handle = None
+                self._remaining = 0
+                continue
+            if not self._advance():
+                break
+        return b"".join(out)
+
+    def close(self) -> None:
+        if self._handle is not None:
+            self._handle.close()
+            self._handle = None
 
 
 def post(endpoint: str, batch: list[str], timeout: int) -> tuple[int, dict | None, str]:
-    """POST one batch. Returns (http_status, parsed_body_or_None, raw)."""
-    cmd = ["curl", "-sS", "--max-time", str(timeout), "-w", "\n%{http_code}", "-X", "POST"]
-    for path in batch:
-        cmd += ["-F", f"files=@{path}"]
-    cmd.append(endpoint)
+    """POST one batch. Returns (http_status, parsed_body_or_None, raw).
+
+    Never raises: every failure becomes a status the caller can report, because
+    a traceback in the middle of a 400-photo upload tells the user nothing about
+    which files made it.
+    """
+    boundary = f"----sustain{uuid.uuid4().hex}"
+    body = _MultipartBody(batch, boundary)
+    request = urllib.request.Request(endpoint, data=body, method="POST")
+    request.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+    request.add_header("Content-Length", str(body.length))
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read().decode("utf-8", "replace")
+            status = response.status
+    except urllib.error.HTTPError as exc:
+        # A 4xx carries the reason (photo_limit_exceeded, a 429, ...), so the
+        # body matters as much as the code.
+        raw = exc.read().decode("utf-8", "replace") if exc.fp else ""
+        status = exc.code
+    except (urllib.error.URLError, OSError) as exc:
+        return 0, None, f"upload failed: {getattr(exc, 'reason', exc)}"
+    finally:
+        body.close()
 
     try:
-        done = subprocess.run(cmd, capture_output=True, text=True)
-    except FileNotFoundError:
-        # No curl on this machine. Reached only if the preflight in main() was
-        # bypassed; without this the user gets a bare traceback instead of a
-        # sentence telling them what to do.
-        return 0, None, CURL_MISSING
-    except OSError as exc:
-        return 0, None, f"could not run curl: {exc}"
-    if done.returncode != 0:
-        return 0, None, (done.stderr or "").strip() or f"curl exit {done.returncode}"
-
-    raw = done.stdout.rsplit("\n", 1)
-    body, status = (raw[0], raw[1]) if len(raw) == 2 else ("", "0")
-    try:
-        return int(status), json.loads(body) if body.strip() else None, body
-    except (ValueError, json.JSONDecodeError):
-        return int(status) if status.isdigit() else 0, None, body
+        return status, (json.loads(raw) if raw.strip() else None), raw
+    except json.JSONDecodeError:
+        return status, None, raw
 
 
 def main() -> int:
@@ -198,11 +295,6 @@ def main() -> int:
         return 2
     if args.folder and not os.path.isdir(args.folder):
         print(f"error: not a directory: {args.folder}", file=sys.stderr)
-        return 2
-    # Fail before surveying hundreds of files, not after. --dry-run never
-    # uploads, so it does not need curl.
-    if not args.dry_run and shutil.which("curl") is None:
-        print(f"error: {CURL_MISSING}", file=sys.stderr)
         return 2
     if not args.dry_run and not args.endpoint:
         print("error: --endpoint is required unless --dry-run", file=sys.stderr)

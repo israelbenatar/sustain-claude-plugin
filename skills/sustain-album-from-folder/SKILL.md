@@ -37,7 +37,7 @@ be on anything.
 | | macOS | Linux | Windows |
 |---|---|---|---|
 | Scan a folder (EXIF, stdlib) | yes | yes | yes |
-| Upload | needs `curl` — present | needs `curl` — usually present | needs `curl` — Win10 1803+ |
+| Upload (stdlib, nothing to install) | yes | yes | yes |
 | `mdls` date recovery for unparseable EXIF | yes | no | no |
 | `--photos-library` (Apple Photos) | yes | no | no |
 
@@ -45,9 +45,9 @@ Off macOS, do not offer `--photos-library` at all — ask for a folder. The scan
 still works everywhere; it just reports a file with no readable EXIF date as
 undated instead of recovering it from Spotlight.
 
-If `curl` is missing, `upload_folder.py` refuses with a message naming the fix.
-Do not try to work around it by reading file bytes into the conversation — give
-the user `upload_page_url` from `request_photos`, which needs nothing installed.
+Both scripts need only `python3`. If the upload fails for any other reason, do
+not work around it by reading file bytes into the conversation — give the user
+`upload_page_url` from `request_photos` instead.
 
 ## What the user has to allow
 

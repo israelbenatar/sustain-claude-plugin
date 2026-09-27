@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "sustain-skills",
   "displayName": "Sustain Skills",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Build a Sustain photo album from a folder on your own machine, over the Sustain remote MCP server.",
   "author": {
     "name": "Sustain",
@@ -10,6 +10,8 @@
   },
   "homepage": "https://www.sustain-app.com/blog/ai-agents-can-use-sustain",
   "license": "MIT",
+  "icon": "./.claude-plugin/icon.svg",
+  "privacyPolicyUrl": "https://www.sustain-app.com/privacy",
   "keywords": [
     "sustain",
     "photo-albums",

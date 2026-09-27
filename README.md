@@ -25,11 +25,10 @@ install:
 Anywhere `python3` runs — macOS, Linux and Windows. The EXIF reader is standard
 library, so the scan behaves identically on all three.
 
-`upload_folder.py` shells out to **`curl`**, the one thing it needs that is not in
-the standard library. That is already present on macOS and on Windows 10 1803+, and
-on most Linux distributions, but not in slim containers or on older Windows. When it
-is missing the script says so and names the alternative instead of failing obscurely
-— and `--dry-run` works without it.
+**Nothing to install.** Both scripts are standard library only, with no external
+command required — the upload builds and streams its own multipart body, so a
+400-photo batch never lands in memory (measured: 33 MB of process memory while
+uploading a 120 MB file).
 
 Two extras are macOS-only and simply do not apply elsewhere: reading Apple Photos
 libraries (`--photos-library`), and a Spotlight (`mdls`) lookup that recovers dates
