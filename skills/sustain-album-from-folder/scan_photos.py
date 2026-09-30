@@ -438,6 +438,101 @@ def narrow(photos, *, since=None, until=None, near=None, radius_km=25.0):
     return kept, notes
 
 
+#: --- Describing photos on this machine, when the machine can ---------------
+#:
+#: macOS 27 ships Apple's on-device model at /usr/bin/fm, and it reads images:
+#: `fm respond --image photo.heic --text "..."`. No key, no account, no cost,
+#: and nothing leaves the Mac. Measured here: ~1.1s per photo once warm, on
+#: both JPEG and HEIC.
+#:
+#: That is the one thing metadata cannot answer -- "the beach ones", "the
+#: photos with the dog" -- and not even the iOS app can do it against the
+#: device, because content search there runs server-side over photos already
+#: uploaded. So this is genuinely extra, and it is also the slowest thing in
+#: this file by three orders of magnitude.
+#:
+#: Hence the rule the code enforces rather than merely advises: it runs ONLY
+#: on photos a metadata filter has already narrowed to. 50 photos is a minute;
+#: a 8,000-photo library is two and a half hours and nobody will wait.
+#:
+#: Optional in exactly the way `mdls` is optional. Absent, unlicensed, or not
+#: macOS, the scan says so in one line and carries on with dates and places.
+
+FM_BIN = "/usr/bin/fm"
+
+#: Past this many candidates, describing is refused rather than started. A
+#: caller who means it raises it; a caller who pointed at a whole library
+#: finds out in a sentence instead of in an hour.
+DESCRIBE_LIMIT = 120
+
+FM_PROMPT = ("In under 12 words, say what is in this photo. Name places, "
+             "objects and activities. Do not guess names of people.")
+
+
+def fm_available() -> tuple[bool, str]:
+    """(usable, why not). Never raises, because this is an optional extra."""
+    if sys.platform != "darwin":
+        return False, "on-device description needs macOS"
+    if not os.path.exists(FM_BIN):
+        return False, "on-device description needs macOS 27 (no /usr/bin/fm here)"
+    try:
+        probe = subprocess.run([FM_BIN, "respond", "--text", "ok"],
+                               capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"could not run fm: {exc}"
+    if probe.returncode != 0:
+        blurb = (probe.stderr or probe.stdout or "").strip().splitlines()
+        hint = blurb[0] if blurb else "fm returned an error"
+        if "LEGAL NOTICE" in (probe.stderr or "") + (probe.stdout or ""):
+            # Machine-wide and needs a privileged user, so the script cannot
+            # do it and should not pretend otherwise.
+            hint = ("Apple's model needs its terms accepted once per machine: "
+                    "run `sudo fm license`")
+        return False, hint
+    return True, ""
+
+
+def describe_photo(path: str, timeout: int = 60) -> str:
+    """One caption, or "" when the model declines or the file cannot be read."""
+    try:
+        done = subprocess.run(
+            [FM_BIN, "respond", "--image", path, "--text", FM_PROMPT],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if done.returncode != 0:
+        return ""
+    return " ".join((done.stdout or "").split())[:200]
+
+
+def describe_all(photos, limit: int = DESCRIBE_LIMIT, log=print):
+    """Caption each photo in place under `desc`. Returns how many succeeded.
+
+    Sequential on purpose. The model is a shared on-device resource and
+    running eight at once made it slower here, not faster.
+    """
+    usable, why = fm_available()
+    if not usable:
+        log(f"describing     : skipped — {why}")
+        return 0
+    if len(photos) > limit:
+        log(f"describing     : skipped — {len(photos)} photos is past the "
+            f"{limit} limit. Narrow with --since/--until or --near, or raise "
+            f"--describe-limit if you mean it (about {len(photos) * 1.1 / 60:.0f} "
+            f"minutes).")
+        return 0
+    done = 0
+    for n, photo in enumerate(photos, 1):
+        caption = describe_photo(photo["path"])
+        if caption:
+            photo["desc"] = caption
+            done += 1
+        if n % 25 == 0 or n == len(photos):
+            log(f"describing     : {n}/{len(photos)}")
+    return done
+
+
 def cluster(photos, gap_hours, place_km):
     """Split a time-sorted list wherever there is a long gap or a big move."""
     events, current = [], []
@@ -607,6 +702,11 @@ def main() -> int:
                     help="Only photos taken within --radius-km of this point")
     ap.add_argument("--radius-km", type=float, default=25.0,
                     help="Radius for --near (default 25)")
+    ap.add_argument("--describe", action="store_true",
+                    help="Describe the matching photos with Apple's on-device model "
+                         "(macOS 27; nothing leaves the machine, costs nothing)")
+    ap.add_argument("--describe-limit", type=int, default=DESCRIBE_LIMIT,
+                    help=f"Refuse to describe more than this many (default {DESCRIBE_LIMIT})")
     ap.add_argument("--json", metavar="PATH", help="Also write the full result, with file lists")
     args = ap.parse_args()
 
@@ -740,6 +840,13 @@ def report(photos, args):
             return 1
         print()
 
+    # 2.75 describe, only ever on what the filters left. Ordering matters:
+    # describing before narrowing would caption the whole library.
+    if getattr(args, "describe", False):
+        described = describe_all(photos, limit=args.describe_limit)
+        if described:
+            print(f"described      : {described} of {len(photos)} photos\n")
+
     # 3. cluster
     photos.sort(key=lambda p: p["taken"])
     events = [describe(e) for e in cluster(photos, args.gap_hours, args.place_km)]
@@ -790,7 +897,14 @@ def report(photos, args):
 
     if args.json:
         with open(args.json, "w") as fh:
-            json.dump({"folder": args.folder, "events": big, "small": small}, fh, indent=2)
+            payload = {"folder": args.folder, "events": big, "small": small}
+            # A path -> caption map rather than a field inside `files`: the
+            # upload script reads `files` as a list of paths and would have to
+            # change shape with it, for a field it never uses.
+            described = {p["path"]: p["desc"] for p in photos if p.get("desc")}
+            if described:
+                payload["descriptions"] = described
+            json.dump(payload, fh, indent=2)
         print(f"\nfull result (with file lists) -> {args.json}")
 
     pending = sum(e.get("not_downloaded", 0) for e in big[:args.max_events])

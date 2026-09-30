@@ -30,11 +30,55 @@ command required — the upload builds and streams its own multipart body, so a
 400-photo batch never lands in memory (measured: 33 MB of process memory while
 uploading a 120 MB file).
 
-Two extras are macOS-only and simply do not apply elsewhere: reading Apple Photos
-libraries (`--photos-library`), and a Spotlight (`mdls`) lookup that recovers dates
-for files whose EXIF the stdlib reader cannot parse. On Linux and Windows the scan
-uses EXIF alone, and a file with no readable date is reported as undated rather than
-guessed at.
+Three extras are macOS-only and simply do not apply elsewhere: reading Apple Photos
+libraries (`--photos-library`), a Spotlight (`mdls`) lookup that recovers dates for
+files whose EXIF the stdlib reader cannot parse, and `--describe` below. On Linux and
+Windows the scan uses EXIF alone, and a file with no readable date is reported as
+undated rather than guessed at.
+
+## Finding photos without uploading them
+
+The scan reads dates and GPS, so it can be asked for a subset rather than a whole
+folder:
+
+```bash
+scan_photos.py --folder ~/Pictures --since 2024-08 --until 2024-08
+scan_photos.py --folder ~/Pictures --near 8.05,98.91 --radius-km 60
+```
+
+The agent does the translating — "last August" into dates, a place name into
+coordinates — and the filters run against metadata. It never looks at a photo, which
+is what keeps this instant on a library of tens of thousands. A photo with **no GPS
+never matches `--near`**, so the scan prints what each filter removed rather than
+leaving "nothing there" and "nothing matched" looking the same.
+
+### Describing photos on the Mac, with nothing leaving it
+
+`--describe` captions the matching photos using Apple's on-device model, so the agent
+can answer *"the beach ones"* about files that were never uploaded:
+
+```bash
+scan_photos.py --folder ~/Pictures --near 13.75,100.50 --radius-km 40 --describe
+```
+
+**Requires macOS 27 on Apple Silicon, and one setup step.** Apple's model needs its
+terms accepted once per machine, by a privileged user:
+
+```bash
+sudo fm license
+```
+
+Until that is done the scan says so in one line and carries on with dates and places.
+It is skipped the same way on Linux and Windows. Nothing about the rest of the skill
+depends on it.
+
+It runs **only on photos the filters already narrowed to**, and refuses past
+`--describe-limit` (120). Measured on this hardware at roughly **1.1 seconds a photo**
+on both JPEG and HEIC — a minute for fifty, two and a half hours for a whole library,
+which is why the limit is a refusal rather than a warning.
+
+Nothing is uploaded, no key or account is involved, and it costs nothing. Captions
+land in the `--json` output under `descriptions`, keyed by path.
 
 ## What it sends, and where
 

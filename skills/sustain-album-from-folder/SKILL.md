@@ -73,11 +73,33 @@ python3 "$SC" --folder "<folder>" --near 8.05,98.91 --radius-km 60 --json /tmp/s
   unplaced, so a place filter can return nothing on a folder that clearly
   contains the trip. When that happens, say so and fall back to dates.
 
+### Content, on a Mac, without uploading anything
+
+`--describe` captions the photos the filters left, using Apple's on-device
+model. That is how "the beach ones" gets answered for files that were never
+uploaded:
+
+```bash
+python3 "$SC" --folder "<folder>" --near 13.75,100.50 --radius-km 40 --describe --json /tmp/sustain-scan.json
+```
+
+Captions come back in the JSON under `descriptions`, keyed by path. Read them
+and pick; do not read the photos themselves into the conversation.
+
+Order matters and the script enforces it: describing runs only on what the
+filters left, and refuses past 120 photos. Roughly a second each, so fifty is
+a minute and a library is hours. Narrow first, always.
+
+macOS 27 on Apple Silicon only, and it needs `sudo fm license` once per
+machine. Anywhere else, or before that is run, the scan says so in one line
+and carries on with dates and places — so never promise content search before
+you have seen it work in the output.
+
 ### What this CANNOT do, and where to send it instead
 
-**People and content do not work on local files.** There is no face index and
-nothing reads the pixels, so "photos of Mia" and "the beach ones" cannot be
-answered from a folder.
+**People never work on local files**, and **content does not work off a Mac**.
+There is no face index, so "photos of Mia" cannot be answered from a folder at
+all; and without `--describe` nothing reads the pixels.
 
 Both work against photos ALREADY IN SUSTAIN, through the `dig_photos` tool on
 the connector: it searches captions, tagged people and visual similarity, and
