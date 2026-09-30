@@ -363,6 +363,81 @@ def haversine_km(a, b):
     return 2 * r * math.asin(math.sqrt(h))
 
 
+#: --- Narrowing a scan to what was actually asked for ------------------------
+#:
+#: The iOS dig works this way and it is worth copying exactly: a model turns
+#: the phrase into STRUCTURED FILTERS -- a date range, a place as a lat/lon
+#: radius, trip-only -- and those filters then run against metadata. The model
+#: never sees a photo. That is what makes it instant on a library of tens of
+#: thousands and what keeps every pixel on the machine.
+#:
+#: The agent calling this script is itself a model, so it does the parsing that
+#: iOS sends to a server: "last summer" becomes --since/--until, "Krabi"
+#: becomes --near with a radius. No round trip and nothing to pay for.
+#:
+#: Person and content ("the beach ones", "photos of Mia") are deliberately
+#: absent. iOS cannot do either against the device either: people resolve
+#: through face clusters the user already tagged in Sustain, and content
+#: through CLIP over photos already uploaded. Both belong to `dig_photos`, and
+#: SKILL.md routes them there rather than pretending here.
+
+
+def parse_when(value: str, *, end: bool = False):
+    """A --since/--until value as a datetime, matching `photo["taken"]`.
+
+    Accepts YYYY, YYYY-MM or YYYY-MM-DD. `end=True` returns the exclusive
+    upper bound of the period named, so --until 2025-08 covers the whole of
+    August rather than only its first instant — which is what a person means
+    and what an agent will pass.
+    """
+    parts = [int(p) for p in str(value).strip().split("-")]
+    if not end:
+        return datetime(*(parts + [1] * (3 - len(parts))))
+    if len(parts) == 1:
+        return datetime(parts[0] + 1, 1, 1)
+    if len(parts) == 2:
+        year, month = parts
+        return datetime(year + 1, 1, 1) if month == 12 else datetime(year, month + 1, 1)
+    return datetime(*parts) + timedelta(days=1)
+
+
+def within_radius(photo, near, radius_km: float) -> bool:
+    """True when the photo has GPS and sits inside the circle.
+
+    A photo with NO GPS fails a place filter rather than passing it. Half a
+    library is typically undated or unplaced, and letting those through would
+    quietly turn "the Krabi ones" into "everything".
+    """
+    lat, lon = photo.get("lat"), photo.get("lon")
+    if lat is None or lon is None:
+        return False
+    return haversine_km((lat, lon), near) <= radius_km
+
+
+def narrow(photos, *, since=None, until=None, near=None, radius_km=25.0):
+    """Apply the structured filters, and report what each one removed.
+
+    Returns (kept, notes). The notes exist because a filter that silently
+    removes everything is indistinguishable from a folder with nothing in it,
+    and the agent has to tell those two apart to say anything useful.
+    """
+    kept, notes = list(photos), []
+    if since is not None:
+        before = len(kept)
+        kept = [p for p in kept if p.get("taken") and p["taken"] >= since]
+        notes.append(f"from {since:%Y-%m-%d}: {before} -> {len(kept)}")
+    if until is not None:
+        before = len(kept)
+        kept = [p for p in kept if p.get("taken") and p["taken"] < until]
+        notes.append(f"before {until:%Y-%m-%d}: {before} -> {len(kept)}")
+    if near is not None:
+        before = len(kept)
+        kept = [p for p in kept if within_radius(p, near, radius_km)]
+        notes.append(f"within {radius_km:g}km: {before} -> {len(kept)} "
+                     f"(photos with no GPS cannot match a place)")
+    return kept, notes
+
+
 def cluster(photos, gap_hours, place_km):
     """Split a time-sorted list wherever there is a long gap or a big move."""
     events, current = [], []
@@ -524,8 +599,33 @@ def main() -> int:
                     help="Events smaller than this are summarised, not proposed")
     ap.add_argument("--max-events", type=int, default=12)
     ap.add_argument("--no-recursive", action="store_true")
+    ap.add_argument("--since", metavar="DATE",
+                    help="Only photos taken on or after this date (YYYY, YYYY-MM or YYYY-MM-DD)")
+    ap.add_argument("--until", metavar="DATE",
+                    help="Only photos taken before the END of this date (inclusive)")
+    ap.add_argument("--near", metavar="LAT,LON",
+                    help="Only photos taken within --radius-km of this point")
+    ap.add_argument("--radius-km", type=float, default=25.0,
+                    help="Radius for --near (default 25)")
     ap.add_argument("--json", metavar="PATH", help="Also write the full result, with file lists")
     args = ap.parse_args()
+
+    # Parse the filters before doing any work, so a malformed date fails in a
+    # sentence rather than after a scan of forty thousand files.
+    try:
+        args._since = parse_when(args.since) if args.since else None
+        args._until = parse_when(args.until, end=True) if args.until else None
+    except (ValueError, TypeError):
+        print("error: --since/--until want YYYY, YYYY-MM or YYYY-MM-DD", file=sys.stderr)
+        return 2
+    args._near = None
+    if args.near:
+        try:
+            lat, lon = (float(x) for x in args.near.split(","))
+            args._near = (lat, lon)
+        except ValueError:
+            print("error: --near wants LAT,LON — e.g. --near 8.05,98.91", file=sys.stderr)
+            return 2
 
     if not args.folder and not args.photos_library:
         print("error: give --folder <dir>, or --photos-library to scan the "
@@ -618,6 +718,28 @@ def main() -> int:
 
 
 def report(photos, args):
+    # 2.5 narrow, before clustering — the filters describe what was asked for,
+    # and clustering what was not asked for would propose the wrong albums.
+    before = len(photos)
+    photos, notes = narrow(
+        photos,
+        since=getattr(args, "_since", None),
+        until=getattr(args, "_until", None),
+        near=getattr(args, "_near", None),
+        radius_km=args.radius_km,
+    )
+    if notes:
+        print(f"filtered       : {before} -> {len(photos)} photos")
+        for note in notes:
+            print(f"                 {note}")
+        if not photos:
+            # Distinguishable from an empty folder, which is the whole point
+            # of keeping the per-filter counts.
+            print("\nNothing matched. Widen the dates, raise --radius-km, or drop "
+                  "--near if the photos may have no GPS.")
+            return 1
+        print()
+
     # 3. cluster
     photos.sort(key=lambda p: p["taken"])
     events = [describe(e) for e in cluster(photos, args.gap_hours, args.place_km)]

@@ -49,6 +49,53 @@ Both scripts need only `python3`. If the upload fails for any other reason, do
 not work around it by reading file bytes into the conversation — give the user
 `upload_page_url` from `request_photos` instead.
 
+## Digging: when they describe what they want rather than name a folder
+
+"Our Thailand trip last August", "the Krabi ones", "photos from the summer".
+Translate the phrase into FILTERS and run them against metadata. You are the
+model that does the parsing — there is nothing to call and nothing to pay for:
+
+```bash
+python3 "$SC" --folder "<folder>" --since 2024-08 --until 2024-08 --json /tmp/sustain-scan.json
+python3 "$SC" --folder "<folder>" --near 8.05,98.91 --radius-km 60 --json /tmp/sustain-scan.json
+```
+
+- `--since` / `--until` take `YYYY`, `YYYY-MM` or `YYYY-MM-DD`. `--until` is
+  INCLUSIVE of the period named: `--until 2024-08` covers all of August.
+- `--near LAT,LON` with `--radius-km`. You know roughly where places are;
+  supply the coordinates yourself. Start wide (50-100km for a city or region,
+  25km for a neighbourhood) — a radius that is too small looks identical to
+  "no photos there".
+- The scan prints what each filter removed. Read it back to the user when the
+  result is surprising: "51 photos, 22 within 60km of Krabi" tells them
+  something; "22 photos" does not.
+- **A photo with no GPS never matches `--near`.** Half a library is often
+  unplaced, so a place filter can return nothing on a folder that clearly
+  contains the trip. When that happens, say so and fall back to dates.
+
+### What this CANNOT do, and where to send it instead
+
+**People and content do not work on local files.** There is no face index and
+nothing reads the pixels, so "photos of Mia" and "the beach ones" cannot be
+answered from a folder.
+
+Both work against photos ALREADY IN SUSTAIN, through the `dig_photos` tool on
+the connector: it searches captions, tagged people and visual similarity, and
+returns ranked photos with a suggested album name. It spends a small number of
+credits per search.
+
+So pick by where the photos are:
+
+| They say | Photos are | Do |
+|---|---|---|
+| "my Thailand trip last August" | in a folder | scan with `--since/--until`, or `--near` |
+| "the beach ones from last summer" | in a folder | dates narrow it; then ask them to confirm the selection — you cannot see the beach |
+| "the beach ones" / "photos of Mia" | already uploaded | `dig_photos` |
+| neither is certain | ask | `list_albums` shows what is already in Sustain |
+
+Do not upload a whole folder in order to make `dig_photos` searchable. That
+spends the user's storage and their patience on photos they did not ask for.
+
 ## What the user has to allow
 
 Check this before promising anything, and never talk someone into a permission
